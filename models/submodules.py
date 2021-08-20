@@ -37,8 +37,10 @@ class unetUp(nn.Module):
 
     def forward(self, inputs1, inputs2):
         outputs2 = self.up(inputs2)
-        buttom, right = inputs1.size(2)%2, inputs1.size(3)%2
-        outputs2 = F.pad(outputs2, (0, -right, 0, -buttom))
+        # buttom, right = inputs1.size(2)%2, inputs1.size(3)%2
+        # outputs2 = F.pad(outputs2, (0, 0-right, 0, 0-buttom))
+        # outputs2 = nn.ZeroPad2d((0, 0-right, 0, 0-buttom))(outputs2)
+        assert outputs2.shape[2:]==inputs1.shape[2:], f'inputs1.shape{inputs1.shape}, outputs2.shape{outputs2.shape}'
         return self.conv(torch.cat([inputs1, outputs2], 1))
 
 class feature_extraction_conv(nn.Module):
