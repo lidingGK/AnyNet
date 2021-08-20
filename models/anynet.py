@@ -1,8 +1,6 @@
-from __future__ import print_function
 import torch
 import torch.nn as nn
 import torch.utils.data
-from torch.autograd import Variable
 import torch.nn.functional as F
 import math
 from .submodules import post_3dconvs,feature_extraction_conv
@@ -16,15 +14,41 @@ class AnyNet(nn.Module):
         self.init_channels = args.init_channels
         self.maxdisplist = args.maxdisplist
         self.spn_init_channels = args.spn_init_channels
+        self.cspn_init_channels = args.cspn_init_channels
         self.nblocks = args.nblocks
         self.layers_3d = args.layers_3d
         self.channels_3d = args.channels_3d
         self.growth_rate = args.growth_rate
         self.with_spn = args.with_spn
+        self.with_cspn = args.with_cspn
+
+        assert not (args.with_spn and args.with_cspn), \
+            'Select only one of SPN and CSPN'
+
+        if self.with_cspn:
+            from .cspn import Affinity_Propagate
+            self.cspn_layer = Affinity_Propagate(4, 3)
+
+            cspnC = self.cspn_init_channels
+            self.refine_cspn = [nn.Sequential(
+                nn.Conv2d(3, cspnC*2, 3, 1, 1, bias=False),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(cspnC*2, cspnC*2, 3, 1, 1, bias=False),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(cspnC*2, cspnC*2, 3, 1, 1, bias=False),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(cspnC*2, cspnC*2, 3, 1, 1, bias=False),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(cspnC*2, cspnC, 3, 1, 1, bias=False),
+            )]
+            self.refine_cspn += [nn.Conv2d(1,cspnC,3,1,1,bias=False)]
+            self.refine_cspn += [nn.Conv2d(cspnC,1,3,1,1,bias=False)]
+            self.refine_cspn = nn.ModuleList(self.refine_cspn)
+        else:
+            self.refine_cspn = None
 
         if self.with_spn:
             try:
-                # from .spn.modules.gaterecurrent2dnoind import GateRecurrent2dnoind
                 from .spn_t1.modules.gaterecurrent2dnoind import GateRecurrent2dnoind
             except:
                 print('Cannot load spn model')
@@ -91,8 +115,10 @@ class AnyNet(nn.Module):
         vgrid[:,:1,:,:] = vgrid[:,:1,:,:] - disp
 
         # scale grid to [-1,1]
-        vgrid[:, 0, :, :] = 2.0 * vgrid[:, 0, :, :].clone() / max(W - 1, 1) - 1.0
-        vgrid[:, 1, :, :] = 2.0 * vgrid[:, 1, :, :].clone() / max(H - 1, 1) - 1.0
+        # vgrid[:, 0, :, :] = 2.0 * vgrid[:, 0, :, :].clone() / max(W - 1, 1) - 1.0
+        # vgrid[:, 1, :, :] = 2.0 * vgrid[:, 1, :, :].clone() / max(H - 1, 1) - 1.0
+        vgrid[:, 0, :, :] = 2.0 * vgrid[:, 0, :, :].clone() / (W - 1) - 1.0
+        vgrid[:, 1, :, :] = 2.0 * vgrid[:, 1, :, :].clone() / (H - 1) - 1.0
 
         vgrid = vgrid.permute(0, 2, 3, 1)
         output = nn.functional.grid_sample(x, vgrid)
@@ -103,7 +129,7 @@ class AnyNet(nn.Module):
         assert maxdisp % stride == 0  # Assume maxdisp is multiple of stride
         cost = torch.zeros((feat_l.size()[0], maxdisp//stride, feat_l.size()[2], feat_l.size()[3]), device='cuda')
         for i in range(0, maxdisp, stride):
-            cost[:, i//stride, :, :i] = feat_l[:, :, :, :i].abs().sum(1)
+            # cost[:, i//stride, :, :i] = feat_l[:, :, :, :i].abs().sum(1)
             if i > 0:
                 cost[:, i//stride, :, i:] = torch.norm(feat_l[:, :, :, i:] - feat_r[:, :, :, :-i], 1, 1)
             else:
@@ -165,6 +191,13 @@ class AnyNet(nn.Module):
             pred_flow = nn.functional.upsample(pred[-1], (img_size[2]//4, img_size[3]//4), mode='bilinear')
             refine_flow = self.spn_layer(self.refine_spn[1](pred_flow), G1, G2, G3)
             refine_flow = self.refine_spn[2](refine_flow)
+            pred.append(nn.functional.upsample(refine_flow, (img_size[2] , img_size[3]), mode='bilinear'))
+        
+        if self.refine_cspn:
+            cspn_out = self.refine_cspn[0](nn.functional.upsample(left, (img_size[2]//4, img_size[3]//4), mode='bilinear'))
+            pred_flow = nn.functional.upsample(pred[-1], (img_size[2]//4, img_size[3]//4), mode='bilinear')
+            refine_flow = self.cspn_layer(cspn_out, self.refine_cspn[1](pred_flow))
+            refine_flow = self.refine_cspn[2](refine_flow)
             pred.append(nn.functional.upsample(refine_flow, (img_size[2] , img_size[3]), mode='bilinear'))
 
 
