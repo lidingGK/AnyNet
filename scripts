@@ -1,0 +1,50 @@
+python main.py --maxdisp 192 --with_spn \
+       --datapath /workspace/data/SceneFlowLns/ \
+       --print_freq 20 \
+       --train_bsize 20 \
+       --init_channels 4 \
+       --growth_rate 4 2 2
+
+
+python finetune.py --maxdisp 192 --with_cspn \
+       --init_channels 4 \
+       --growth_rate 4 2 2 \
+       --datapath path-to-kitti2015/training/ \
+       --pretrained checkpoint/sceneflow/sceneflow.tar
+
+
+python test_sv.py --maxdisp 192 --with_spn \
+       --init_channels 4 \
+       --growth_rate 4 2 2 \
+       --pretrained results/finetune_bignet/checkpoint.tar
+
+python test_sv.py --maxdisp 192 --with_cspn \
+       --pretrained results/pretrained_anynet/cspn1/checkpoint.tar 
+
+python convert_to_trt.py --maxdisp 192 --with_cspn \
+       --pretrained results/pretrained_anynet/cspn1/checkpoint.tar
+
+python convert_to_trt.py --maxdisp 192 --with_cspn \
+       --pretrained results/pretrained_cspn_deb3/checkpoint.tar
+
+python main.py --maxdisp 192 --with_cspn \
+       --datapath /workspace/data/SceneFlowLns/ \
+       --print_freq 20 \
+       --save_path results/pretrained_cspn_deb3
+
+python finetune.py --maxdisp 192 --with_cspn \
+       --datapath data/kitti2015/training/ \
+       --pretrained results/pretrained_anynet/cspn1/checkpoint.tar \
+       --save_path results/pretrained_anynet/cspn1
+
+
+python finetune.py --maxdisp 192 --with_spn --datapath path-to-kitti2015/training/
+
+# Remember set Anynet output
+LD_PRELOAD=/root/mmcv/mmcv/_ext_trt.cpython-36m-x86_64-linux-gnu.so \
+python /workspace/depth/AnyNet/convert_to_trt.py \
+       --with_cspn \
+       --pretrained results/finetune_cspn_final/checkpoint.tar 
+
+LD_PRELOAD=/root/mmcv/mmcv/_ext_trt.cpython-36m-x86_64-linux-gnu.so \
+python mmcv_conv.py

@@ -10,7 +10,6 @@ import time
 import utils.logger as logger
 import torch.backends.cudnn as cudnn
 
-import models.anynet
 
 parser = argparse.ArgumentParser(description='Anynet fintune on KITTI')
 parser.add_argument('--maxdisp', type=int, default=192,
@@ -30,13 +29,15 @@ parser.add_argument('--save_path', type=str, default='results/infer',
 parser.add_argument('--lr', type=float, default=5e-4,
                     help='learning rate')
 parser.add_argument('--with_spn', action='store_true', default=False)
+parser.add_argument('--with_cspn', action='store_true', help='with cspn network or not')
+parser.add_argument('--spn_init_channels', type=int, default=8, help='initial channels for spnet')
+parser.add_argument('--cspn_init_channels', type=int, default=8, help='initial channels for cspnet')
 parser.add_argument('--print_freq', type=int, default=5, help='print frequence')
 parser.add_argument('--init_channels', type=int, default=1, help='initial channels for 2d feature extractor')
 parser.add_argument('--nblocks', type=int, default=2, help='number of layers in each stage')
 parser.add_argument('--channels_3d', type=int, default=4, help='number of initial channels 3d feature extractor ')
 parser.add_argument('--layers_3d', type=int, default=4, help='number of initial layers in 3d network')
 parser.add_argument('--growth_rate', type=int, nargs='+', default=[4,1,1], help='growth rate in the 3d network')
-parser.add_argument('--spn_init_channels', type=int, default=8, help='initial channels for spnet')
 parser.add_argument('--start_epoch_for_spn', type=int, default=121)
 parser.add_argument('--pretrained', type=str, default='checkpoint/kitti2015_ck/checkpoint.tar',
                     help='pretrained model path')
@@ -54,6 +55,33 @@ import cv2
 import matplotlib.pyplot as plt
 from torchvision.transforms.functional import hflip
 
+
+from mmcv.onnx.symbolic import register_extra_symbolics
+from mmcv.tensorrt import TRTWrapper, is_tensorrt_plugin_loaded
+
+register_extra_symbolics(11)
+assert is_tensorrt_plugin_loaded(), 'Requires to complie TensorRT plugins in mmcv'
+
+class Trt_model:
+    def __init__(self, trt_file):
+        self.model = TRTWrapper(trt_file, ['left', 'right'], ['output'])
+     
+    def inference(self, imgL, imgR):
+        imgL = imgL.cuda()
+        imgR = imgR.cuda()
+
+        input_L = imgL
+        input_R = imgR
+
+        output = self.model({'left': input_L, 'right': input_R})
+        disp = output['output']
+        
+        disp = torch.squeeze(disp)
+        pred_disp = disp.data.cpu().numpy()
+
+        return pred_disp
+
+
 def test(model, imgL, imgR, left_right_left=False):
 
     imgL = imgL.cuda()
@@ -68,14 +96,14 @@ def test(model, imgL, imgR, left_right_left=False):
 
     model.eval()
     with torch.no_grad():
-        disp = model(input_L,input_R)[-1]
+        disp = model(input_L,input_R)
 
-    if left_right_left:
-        disp_L, disp_R = disp[0], disp[1]
-        disp = torch.cat((disp_L, hflip(disp_R)), dim=0)
-    
-    disp = torch.squeeze(disp)
-    pred_disp = disp.data.cpu().numpy()
+        if left_right_left:
+            disp_L, disp_R = disp[0], disp[1]
+            disp = torch.cat((disp_L, hflip(disp_R)), dim=0)
+        
+        disp = torch.squeeze(disp)
+        pred_disp = disp.data.cpu().numpy()
 
     return pred_disp
 
@@ -112,22 +140,30 @@ def main():
     log = logger.setup_logger(args.save_path + '/infer.log')
 
 
-    model = models.anynet.AnyNet(args)
-    model = nn.DataParallel(model).cuda()
+    # model = models.anynet.AnyNet(args)
+    # model = model.cuda()
+    # model = nn.DataParallel(model).cuda()
 
-    log.info('Number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
 
-    if args.pretrained:
-        if os.path.isfile(args.pretrained):
-            checkpoint = torch.load(args.pretrained)
-            model.load_state_dict(checkpoint['state_dict'], strict=False)
-            log.info("=> loaded pretrained model '{}'"
-                     .format(args.pretrained))
-        else:
-            log.info("=> no pretrained model found at '{}'".format(args.pretrained))
-            log.info("=> Will start from scratch.")
+    model_trt = Trt_model('sample.trt')
+
+    # log.info('Number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
+
+    # if args.pretrained:
+    #     if os.path.isfile(args.pretrained):
+    #         checkpoint = torch.load(args.pretrained)
+    #         model.load_state_dict(checkpoint['state_dict'], strict=False)
+    #         log.info("=> loaded pretrained model '{}'"
+    #                  .format(args.pretrained))
+    #     else:
+    #         log.info("=> no pretrained model found at '{}'".format(args.pretrained))
+    #         log.info("=> Will start from scratch.")
 
     log.info(f"=> {args.with_spn}, with spn network")
+    log.info(f"=> {args.with_cspn}, with cspn network")
+
+    for key, value in sorted(vars(args).items()):
+        log.info(str(key) + ': ' + str(value))
     
     cudnn.benchmark = False
     torch.backends.cudnn.enabled = False 
@@ -138,7 +174,7 @@ def main():
                         'std': [0.229, 0.224, 0.225]}
     infer_transform = transforms.Compose([transforms.ToTensor(),
                                         transforms.Normalize(**normal_mean_var),
-                                        # transforms.Resize((352, 640)),
+                                        # transforms.Resize((32*9, 32*16)),
                                         ])  
     init = sl.InitParameters()
     init.camera_resolution = sl.RESOLUTION.HD720
@@ -159,8 +195,6 @@ def main():
     # Create DisparityWLSFilter
     wsize=31
     max_disp = 128
-    sigma = 1.5
-    lmbda = 8000.0
     left_matcher = cv2.StereoBM_create(max_disp, wsize)
 
     wls_filter = cv2.ximgproc.createDisparityWLSFilter(left_matcher)
@@ -214,7 +248,9 @@ def main():
             imgR = F.pad(imgR,(0,right_pad, top_pad,0)).unsqueeze(0)
 
             start_time = time.perf_counter()
-            pred_disp = test(model, imgL, imgR)
+            # pred_disp = test(model, imgL, imgR)
+
+            pred_disp = model_trt.inference(imgL, imgR)
             print(f'Speed = {1/(time.perf_counter() - start_time):3.0f} FPS')
 
             if top_pad !=0 and right_pad != 0:
