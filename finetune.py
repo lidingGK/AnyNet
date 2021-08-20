@@ -10,8 +10,12 @@ import time
 from dataloader import KITTILoader as DA
 import utils.logger as logger
 import torch.backends.cudnn as cudnn
+from torch.utils.tensorboard import SummaryWriter
+from torchvision.utils import make_grid
+from utils.meters import AverageMeter
 
 import models.anynet
+torch.backends.cudnn.enabled = False
 
 parser = argparse.ArgumentParser(description='Anynet fintune on KITTI')
 parser.add_argument('--maxdisp', type=int, default=192,
@@ -35,16 +39,17 @@ parser.add_argument('--resume', type=str, default=None,
 parser.add_argument('--lr', type=float, default=5e-4,
                     help='learning rate')
 parser.add_argument('--with_spn', action='store_true', help='with spn network or not')
+parser.add_argument('--with_cspn', action='store_true', help='with cspn network or not')
+parser.add_argument('--spn_init_channels', type=int, default=8, help='initial channels for spnet')
+parser.add_argument('--cspn_init_channels', type=int, default=8, help='initial channels for cspnet')
 parser.add_argument('--print_freq', type=int, default=5, help='print frequence')
 parser.add_argument('--init_channels', type=int, default=1, help='initial channels for 2d feature extractor')
 parser.add_argument('--nblocks', type=int, default=2, help='number of layers in each stage')
 parser.add_argument('--channels_3d', type=int, default=4, help='number of initial channels 3d feature extractor ')
 parser.add_argument('--layers_3d', type=int, default=4, help='number of initial layers in 3d network')
 parser.add_argument('--growth_rate', type=int, nargs='+', default=[4,1,1], help='growth rate in the 3d network')
-parser.add_argument('--spn_init_channels', type=int, default=8, help='initial channels for spnet')
 parser.add_argument('--start_epoch_for_spn', type=int, default=121)
-parser.add_argument('--pretrained', type=str, default='results/pretrained_anynet/checkpoint.tar',
-                    help='pretrained model path')
+parser.add_argument('--pretrained', type=str, default='results/pretrained_anynet/checkpoint.tar', help='pretrained model path')
 parser.add_argument('--split_file', type=str, default=None)
 parser.add_argument('--evaluate', action='store_true')
 
@@ -79,8 +84,10 @@ def main():
     for key, value in sorted(vars(args).items()):
         log.info(str(key) + ': ' + str(value))
 
-    model = models.anynet.AnyNet(args)
-    model = nn.DataParallel(model).cuda()
+    writer = SummaryWriter(args.save_path +'/experiment')
+
+    model = models.anynet.AnyNet(args).cuda()
+    # model = nn.DataParallel(model).cuda()
     optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999))
     log.info('Number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
 
@@ -117,7 +124,8 @@ def main():
         log.info('This is {}-th epoch'.format(epoch))
         adjust_learning_rate(optimizer, epoch)
 
-        train(TrainImgLoader, model, optimizer, log, epoch)
+        test(TestImgLoader, model, log, writer, step=epoch*len(TestImgLoader))
+        train(TrainImgLoader, model, optimizer, log, epoch, writer)
 
         savefilename = args.save_path + '/checkpoint.tar'
         torch.save({
@@ -126,16 +134,13 @@ def main():
             'optimizer': optimizer.state_dict(),
         }, savefilename)
 
-        if epoch % 1 ==0:
-            test(TestImgLoader, model, log)
-
-    test(TestImgLoader, model, log)
+    test(TestImgLoader, model, log, writer, step=(epoch+1)*len(TrainImgLoader))
     log.info('full training time = {:.2f} Hours'.format((time.time() - start_full_time) / 3600))
 
 
-def train(dataloader, model, optimizer, log, epoch=0):
+def train(dataloader, model, optimizer, log, epoch=0, writer=None):
 
-    stages = 3 + args.with_spn
+    stages = 3 + (args.with_spn or args.with_cspn)
     losses = [AverageMeter() for _ in range(stages)]
     length_loader = len(dataloader)
 
@@ -168,7 +173,10 @@ def train(dataloader, model, optimizer, log, epoch=0):
         for idx in range(num_out):
             losses[idx].update(loss[idx].item())
 
-        if batch_idx % args.print_freq:
+        if batch_idx % args.print_freq == 0:
+            for i in range(num_out):
+                writer.add_scalar(f'Train_Loss2/Stage_{i}', losses[i].val, epoch*length_loader+batch_idx)
+
             info_str = ['Stage {} = {:.2f}({:.2f})'.format(x, losses[x].val, losses[x].avg) for x in range(num_out)]
             info_str = '\t'.join(info_str)
 
@@ -178,9 +186,9 @@ def train(dataloader, model, optimizer, log, epoch=0):
     log.info('Average train loss = ' + info_str)
 
 
-def test(dataloader, model, log):
+def test(dataloader, model, log, writer, step):
 
-    stages = 3 + args.with_spn
+    stages = 3 + (args.with_spn or args.with_cspn)
     D1s = [AverageMeter() for _ in range(stages)]
     length_loader = len(dataloader)
 
@@ -197,10 +205,18 @@ def test(dataloader, model, log):
                 output = torch.squeeze(outputs[x], 1)
                 D1s[x].update(error_estimating(output, disp_L).item())
 
-        info_str = '\t'.join(['Stage {} = {:.4f}({:.4f})'.format(x, D1s[x].val, D1s[x].avg) for x in range(stages)])
+        if batch_idx % args.print_freq == 0:
+            info_str = '\t'.join(['Stage {} = {:.4f}({:.4f})'.format(x, D1s[x].val, D1s[x].avg) for x in range(stages)])
+            log.info('[{}/{}] {}'.format(batch_idx, length_loader, info_str))
 
-        log.info('[{}/{}] {}'.format(
-            batch_idx, length_loader, info_str))
+    for i in range(stages):
+        writer.add_scalar(f'Test_Loss/Stage_{i}', D1s[i].avg, step)
+
+    writer.add_image('Test_Left', make_grid(imgL, normalize=True), step)
+    writer.add_image('Test_Right', make_grid(imgR, normalize=True), step)
+    writer.add_image('Disparity_gt', make_grid(disp_L.unsqueeze(1)/args.maxdisp), step)
+    for i in range(stages):
+        writer.add_image(f'prediction/stage{i}', make_grid(outputs[i]/args.maxdisp), step)
 
     info_str = ', '.join(['Stage {}={:.4f}'.format(x, D1s[x].avg) for x in range(stages)])
     log.info('Average test 3-Pixel Error = ' + info_str)
@@ -224,24 +240,6 @@ def adjust_learning_rate(optimizer, epoch):
         lr = args.lr * 0.01
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
-
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
 
 if __name__ == '__main__':
     main()

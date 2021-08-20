@@ -1,7 +1,6 @@
 import argparse
 import os
 import torch
-import torch.nn as nn
 import torch.nn.parallel
 import torch.optim as optim
 import torch.utils.data
@@ -10,8 +9,13 @@ import time
 from dataloader import listflowfile as lt
 from dataloader import SecenFlowLoader as DA
 import utils.logger as logger
+from utils.meters import AverageMeter
+
+from torch.utils.tensorboard import SummaryWriter
+from torchvision.utils import make_grid
 
 import models.anynet
+torch.backends.cudnn.enabled = False
 
 parser = argparse.ArgumentParser(description='AnyNet with Flyingthings3d')
 parser.add_argument('--maxdisp', type=int, default=192, help='maxium disparity')
@@ -23,7 +27,7 @@ parser.add_argument('--epochs', type=int, default=10,
                     help='number of epochs to train')
 parser.add_argument('--train_bsize', type=int, default=6,
                     help='batch size for training (default: 12)')
-parser.add_argument('--test_bsize', type=int, default=4,
+parser.add_argument('--test_bsize', type=int, default=20,
                     help='batch size for testing (default: 8)')
 parser.add_argument('--save_path', type=str, default='results/pretrained_anynet',
                     help='the path of saving checkpoints and log')
@@ -32,17 +36,20 @@ parser.add_argument('--resume', type=str, default=None,
 parser.add_argument('--lr', type=float, default=5e-4,
                     help='learning rate')
 parser.add_argument('--with_spn', action='store_true', help='with spn network or not')
-parser.add_argument('--print_freq', type=int, default=5, help='print frequence')
+parser.add_argument('--with_cspn', action='store_true', help='with cspn network or not')
+parser.add_argument('--spn_init_channels', type=int, default=8, help='initial channels for spnet')
+parser.add_argument('--cspn_init_channels', type=int, default=8, help='initial channels for cspnet')
+parser.add_argument('--print_freq', type=int, default=20, help='print frequence')
 parser.add_argument('--init_channels', type=int, default=1, help='initial channels for 2d feature extractor')
 parser.add_argument('--nblocks', type=int, default=2, help='number of layers in each stage')
 parser.add_argument('--channels_3d', type=int, default=4, help='number of initial channels of the 3d network')
 parser.add_argument('--layers_3d', type=int, default=4, help='number of initial layers of the 3d network')
 parser.add_argument('--growth_rate', type=int, nargs='+', default=[4,1,1], help='growth rate in the 3d network')
-parser.add_argument('--spn_init_channels', type=int, default=8, help='initial channels for spnet')
-
 
 args = parser.parse_args()
 
+
+# torch.autograd.set_detect_anomaly(True) 
 
 def main():
     global args
@@ -64,8 +71,10 @@ def main():
     for key, value in sorted(vars(args).items()):
         log.info(str(key) + ': ' + str(value))
 
-    model = models.anynet.AnyNet(args)
-    model = nn.DataParallel(model).cuda()
+    writer = SummaryWriter(args.save_path +'/experiment')
+
+    model = models.anynet.AnyNet(args).cuda()
+    # model = nn.DataParallel(model).cuda()
     optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999))
     log.info('Number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
 
@@ -87,9 +96,11 @@ def main():
 
     start_full_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
+
         log.info('This is {}-th epoch'.format(epoch))
 
-        train(TrainImgLoader, model, optimizer, log, epoch)
+        test(TestImgLoader, model, log, writer, step=epoch*len(TrainImgLoader))
+        train(TrainImgLoader, model, optimizer, log, epoch, writer)
 
         savefilename = args.save_path + '/checkpoint.tar'
         torch.save({
@@ -98,13 +109,13 @@ def main():
             'optimizer': optimizer.state_dict(),
         }, savefilename)
 
-    test(TestImgLoader, model, log)
+    test(TestImgLoader, model, log, writer, step=epoch*len(TrainImgLoader))
     log.info('full training time = {:.2f} Hours'.format((time.time() - start_full_time) / 3600))
 
 
-def train(dataloader, model, optimizer, log, epoch=0):
+def train(dataloader, model, optimizer, log, epoch=0, writer=None):
 
-    stages = 3 + args.with_spn
+    stages = 3 + (args.with_spn or args.with_cspn)
     losses = [AverageMeter() for _ in range(stages)]
     length_loader = len(dataloader)
 
@@ -124,13 +135,22 @@ def train(dataloader, model, optimizer, log, epoch=0):
         outputs = [torch.squeeze(output, 1) for output in outputs]
         loss = [args.loss_weights[x] * F.smooth_l1_loss(outputs[x][mask], disp_L[mask], size_average=True)
                 for x in range(stages)]
+        
+        for i in loss:
+            if torch.isnan(i).any():
+                print('=='*100)
+                import pdb; pdb.set_trace()
+
         sum(loss).backward()
         optimizer.step()
 
         for idx in range(stages):
             losses[idx].update(loss[idx].item()/args.loss_weights[idx])
 
-        if batch_idx % args.print_freq:
+        if batch_idx % args.print_freq == 0:
+            for i in range(stages):
+                writer.add_scalar(f'Train_Loss2/Stage_{i}', losses[i].val, epoch*length_loader+batch_idx)
+
             info_str = ['Stage {} = {:.2f}({:.2f})'.format(x, losses[x].val, losses[x].avg) for x in range(stages)]
             info_str = '\t'.join(info_str)
 
@@ -140,9 +160,9 @@ def train(dataloader, model, optimizer, log, epoch=0):
     log.info('Average train loss = ' + info_str)
 
 
-def test(dataloader, model, log):
+def test(dataloader, model, log, writer=None, step=0):
 
-    stages = 3 + args.with_spn
+    stages = 3 + (args.with_spn or args.with_cspn)
     EPEs = [AverageMeter() for _ in range(stages)]
     length_loader = len(dataloader)
 
@@ -164,31 +184,22 @@ def test(dataloader, model, log):
                 output = output[:, 4:, :]
                 EPEs[x].update((output[mask] - disp_L[mask]).abs().mean())
 
-        info_str = '\t'.join(['Stage {} = {:.2f}({:.2f})'.format(x, EPEs[x].val, EPEs[x].avg) for x in range(stages)])
+        if batch_idx % args.print_freq == 0:
+            info_str = '\t'.join(['[Testing] Stage {} = {:.2f}({:.2f})'.format(x, EPEs[x].val, EPEs[x].avg) for x in range(stages)])
+            log.info('[{}/{}] {}'.format(batch_idx, length_loader, info_str))
 
-        log.info('[{}/{}] {}'.format(
-            batch_idx, length_loader, info_str))
+    for i in range(stages):
+        writer.add_scalar(f'Test_Loss/Stage_{i}', EPEs[i].avg, step)
 
-    info_str = ', '.join(['Stage {}={:.2f}'.format(x, EPEs[x].avg) for x in range(stages)])
+    writer.add_image('Test_Left', make_grid(imgL, normalize=True), step)
+    writer.add_image('Test_Right', make_grid(imgR, normalize=True), step)
+    writer.add_image('Disparity_gt', make_grid(disp_L.unsqueeze(1)/args.maxdisp), step)
+    for i in range(stages):
+        writer.add_image(f'prediction/stage{i}', make_grid(outputs[i]/args.maxdisp), step)
+
+    info_str = ', '.join(['[Testing] Stage {}={:.2f}'.format(x, EPEs[x].avg) for x in range(stages)])
     log.info('Average test EPE = ' + info_str)
 
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
 
 if __name__ == '__main__':
     main()

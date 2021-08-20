@@ -42,8 +42,8 @@ def dataloader(filepath):
             if is_image_file(monkaa_path + '/' + dd + '/right/' + im):
                 all_right_img.append(monkaa_path + '/' + dd + '/right/' + im)
 
-    flying_path = filepath + [x for x in image if x == 'frames_cleanpass'][0]
-    flying_disp = filepath + [x for x in disp if x == 'frames_disparity'][0]
+    flying_path = filepath + [x for x in image if x == 'flyingthings3d__frames_cleanpass'][0]
+    flying_disp = filepath + [x for x in disp if x == 'flyingthings3d__disparity'][0]
     flying_dir = flying_path + '/TRAIN/'
     subdir = ['A', 'B', 'C']
 
@@ -100,3 +100,7 @@ def dataloader(filepath):
                         all_right_img.append(driving_dir + i + '/' + j + '/' + k + '/right/' + im)
 
     return all_left_img, all_right_img, all_left_disp, test_left_img, test_right_img, test_left_disp
+
+if __name__ == '__main__':
+    results = dataloader('/workspace/data/SceneFlowLns')
+    print(results)
